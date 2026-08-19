@@ -11,7 +11,6 @@ runtime/*.log
 runtime/*.lock
 tests
 *.md
-*.png
 *.jpg
 *.jpeg
 *.webp
