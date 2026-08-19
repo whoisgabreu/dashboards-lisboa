@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .env
+.venv
 data/*.db
 data/api_cache/
 runtime/*.log
