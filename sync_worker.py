@@ -24,7 +24,8 @@ import time
 
 from core.data import clear_cache
 from core.storage import init_db, list_tenants
-from core.sync import historical_window_for, sync_platform, sync_window_for
+from core.leads import sync_leads
+from core.sync import historical_window_for, platform_account_ids, sync_platform, sync_window_for
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -83,8 +84,14 @@ def run_cycle(
     today = date.today()
     tenants = [tenant for tenant in list_tenants() if tenant.get("status") == "active"]
     for tenant in tenants:
-        for platform, field in (("meta", "meta_ad_account_id"), ("google", "google_ads_customer_id")):
-            if not tenant.get(field):
+        try:
+            total = sync_leads(tenant)
+            if total is not None:
+                log(f"{tenant['slug']} leads: {total} linhas da planilha")
+        except Exception as exc:
+            log(f"{tenant['slug']} leads: ERRO - {type(exc).__name__}: {exc}")
+        for platform in ("meta", "google"):
+            if not platform_account_ids(tenant, platform):
                 continue
             start, end = sync_window_for(tenant["id"], platform, today, refresh_days, backfill_days)
             try:

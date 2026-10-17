@@ -81,6 +81,41 @@ KEYWORD_COLUMNS = [
 ]
 
 
+FRENTE_CAMPAIGN_COLUMNS = [
+    NAME_COL,
+    {"key": "frente", "label": "Frente", "type": "text", "bar": False, "width": "120px"},
+    STATUS_COL,
+    _col("investimento", "Investimento", "currency", bar=True),
+    _col("impressoes", "Impressões", "compact"),
+    _col("cliques", "Cliques", "compact"),
+    _col("ctr", "CTR", "percent"),
+    _col("cpc", "CPC", "currency_cents"),
+    _col("leads", "Leads", "int"),
+    _col("cpl", "CPL", "currency_cents"),
+]
+
+LEAD_LP_COLUMNS = [
+    {"key": "nome", "label": "Landing page", "type": "name", "bar": False, "width": "34%"},
+    {"key": "frente", "label": "Frente", "type": "text", "bar": False, "width": "120px"},
+    _col("leads", "Leads", "int", bar=True),
+    _col("share", "% do total", "percent"),
+    _col("anterior", "Período anterior", "int"),
+]
+
+LEAD_SOURCE_COLUMNS = [
+    {"key": "nome", "label": "utm_source / utm_medium", "type": "name", "bar": False, "width": "46%"},
+    _col("leads", "Leads", "int", bar=True),
+    _col("share", "% do total", "percent"),
+]
+
+LEAD_CAMPAIGN_COLUMNS = [
+    {"key": "nome", "label": "Campanha (utm_campaign)", "type": "name", "bar": False, "width": "42%"},
+    {"key": "lp", "label": "LP", "type": "text", "bar": False, "width": "180px"},
+    _col("leads", "Leads", "int", bar=True),
+    _col("share", "% do total", "percent"),
+]
+
+
 def _source(*path):
     """Caminho dentro do dataset — ex.: _source('meta', 'adsets')."""
 
@@ -93,7 +128,47 @@ def _source(*path):
     return resolve
 
 
+def _leads_source(key):
+    def resolve(period_id: str):
+        from core.leads import get_leads_dataset
+
+        return get_leads_dataset(period_id)[key]
+
+    return resolve
+
+
 TABLE_SPECS = {
+    "frentes-campanhas": {
+        "columns": FRENTE_CAMPAIGN_COLUMNS,
+        "source": _source("campaigns"),
+        "sort": "investimento",
+        "placeholder": "Buscar campanha ou frente…",
+        "empty": "Nenhuma campanha corresponde à busca",
+    },
+    "leads-lp": {
+        "columns": LEAD_LP_COLUMNS,
+        "source": _leads_source("by_lp"),
+        "sort": "leads",
+        "placeholder": "Buscar LP…",
+        "empty": "Nenhuma LP corresponde à busca",
+        "status_filter": False,
+    },
+    "leads-origem": {
+        "columns": LEAD_SOURCE_COLUMNS,
+        "source": _leads_source("by_source"),
+        "sort": "leads",
+        "placeholder": "Buscar origem…",
+        "empty": "Nenhuma origem corresponde à busca",
+        "status_filter": False,
+    },
+    "leads-campanha": {
+        "columns": LEAD_CAMPAIGN_COLUMNS,
+        "source": _leads_source("by_campaign"),
+        "sort": "leads",
+        "placeholder": "Buscar campanha…",
+        "empty": "Nenhuma campanha corresponde à busca",
+        "status_filter": False,
+    },
     "campanhas": {
         "columns": CAMPAIGN_COLUMNS,
         "source": _source("campaigns"),
@@ -289,6 +364,8 @@ def _searchable(row: dict) -> str:
         str(row.get("nome", "")),
         CHANNEL_NAMES.get(row.get("canal"), ""),
         str(row.get("correspondencia", "")),
+        str(row.get("frente", "")),
+        str(row.get("lp", "")),
         STATUS_LABEL.get(row.get("status"), {}).get("label", ""),
     ]
     return " ".join(parts).lower()
@@ -471,6 +548,9 @@ def data_table(tid: str, period_id: str, title: str, subtitle: str = None, actio
                                 clearable=False,
                                 searchable=False,
                                 className="select table-status-filter",
+                                # Some sem sair do DOM: a callback MATCH da
+                                # tabela espera este Input em toda tabela.
+                                style={"display": "none"} if spec.get("status_filter") is False else None,
                             ),
                             text_input(
                                 placeholder=spec["placeholder"],

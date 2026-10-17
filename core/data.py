@@ -11,7 +11,9 @@ import threading
 from core.auth import active_tenant
 from core.integrations import google_ads
 from core.mock import DEFAULT_PERIOD, METRIC_KEYS, METRIC_LABELS, PERIODS, STATUS_LABEL, get_period
-from core.storage import get_media_rows, get_media_sync_state, get_tenant, media_data_bounds
+from core.storage import (
+    get_media_rows, get_media_sync_state, get_tenant, media_data_bounds, tenant_media_accounts,
+)
 
 
 _DATASET_LOCKS: dict[tuple, threading.Lock] = {}
@@ -229,6 +231,7 @@ def _rollup_meta_ads(ads: list[dict], level: str) -> list[dict]:
                 "nome": name or ad.get("nome") or "Sem nome",
                 "status": ad.get("status") or "active",
                 "canal": "meta",
+                "account_id": ad.get("account_id"),
                 "campanha": ad.get("campanha"),
                 "conjunto": ad.get("conjunto") if level == "adset" else None,
                 "investimento": 0.0,
@@ -266,9 +269,26 @@ def _series_from_storage(rows: list[dict], start: date, end: date) -> list[dict]
         target = by_date.get(source.get("metric_date"))
         if not target:
             continue
+        # Soma, não atribui: um tenant pode ter mais de uma conta na mesma
+        # plataforma, e cada conta grava a própria linha "account" por dia.
         for key in ("investimento", "receita", "impressoes", "cliques", "leads", "conversoes", "alcance"):
-            target[key] = _number(source.get(key))
+            target[key] += _number(source.get(key))
     return _finalize_series(series)
+
+
+def _account_totals(rows: list[dict]) -> dict[str, dict]:
+    """Totais do período por conta, a partir das linhas de nível "account"."""
+    result: dict[str, dict] = {}
+    for source in rows:
+        if source.get("level") != "account":
+            continue
+        current = result.setdefault(
+            str(source.get("account_id")),
+            {key: 0.0 for key in ("investimento", "receita", "impressoes", "cliques", "leads", "conversoes", "alcance")},
+        )
+        for key in current:
+            current[key] += _number(source.get(key))
+    return result
 
 
 def _stored_entities(rows: list[dict], level: str, channel: str) -> list[dict]:
@@ -287,6 +307,7 @@ def _stored_entities(rows: list[dict], level: str, channel: str) -> list[dict]:
                 "status": source.get("status") or "active",
                 "canal": channel,
                 "campaign_id": str(source.get("campaign_id") or ""),
+                "account_id": str(source.get("account_id") or ""),
                 "adset_id": str(source.get("parent_id") or "") if channel == "meta" else "",
                 "campanha": source.get("campaign_name"),
                 "conjunto": source.get("parent_name"),
@@ -376,7 +397,7 @@ def _load_meta(
     result = {
         "status": "unconfigured", "message": "Conta Meta Ads não vinculada.",
         "series": _blank_series(start, end), "previous": _blank_series(previous_start, previous_end),
-        "campaigns": [], "adsets": [], "ads": [],
+        "campaigns": [], "adsets": [], "ads": [], "by_account": {}, "by_account_previous": {},
     }
     if not account_id:
         return result
@@ -396,6 +417,8 @@ def _load_meta(
             "campaigns": _rollup_meta_ads(ads, "campaign"),
             "adsets": _rollup_meta_ads(ads, "adset"),
             "ads": ads,
+            "by_account": _account_totals(current_rows),
+            "by_account_previous": _account_totals(previous_rows),
         }
     )
     return result
@@ -513,6 +536,7 @@ def _load_google(
         "status": "unconfigured", "message": "Conta Google Ads não vinculada.",
         "series": _blank_series(start, end), "previous": _blank_series(previous_start, previous_end),
         "campaigns": [], "groups": [], "keywords": [], "ads": [], "auction": {},
+        "by_account": {}, "by_account_previous": {},
     }
     if not customer_id:
         return result
@@ -544,6 +568,8 @@ def _load_google(
             "keywords": _stored_entities(current_rows, "keyword", "google"),
             "ads": _stored_entities(current_rows, "ad", "google"),
             "auction": auction,
+            "by_account": _account_totals(current_rows),
+            "by_account_previous": _account_totals(previous_rows),
         }
     )
     return result
@@ -625,8 +651,64 @@ def _meta_highlights(campaigns: list[dict]) -> list[dict]:
     ]
 
 
+FRENTE_KEYS = ("investimento", "impressoes", "cliques", "leads", "conversoes", "alcance")
+PLATFORM_NAMES = {"meta": "Meta Ads", "google": "Google Ads"}
+
+
+def _with_rates(row: dict) -> dict:
+    row.update(
+        {
+            "ctr": _safe_div(row["cliques"], row["impressoes"]) * 100,
+            "cpc": _safe_div(row["investimento"], row["cliques"]),
+            "cpl": _safe_div(row["investimento"], row["leads"]),
+        }
+    )
+    return row
+
+
+def _frentes(accounts: tuple, meta: dict, google: dict) -> list[dict]:
+    """
+    Uma linha por frente × plataforma, mais o subtotal de cada frente.
+
+    A frente vem do rótulo da conta (`tenant_media_accounts`). Conta sem
+    rótulo cai em "Sem frente" — melhor aparecer do que sumir do total.
+    """
+    if not accounts:
+        return []
+    details = {"meta": meta, "google": google}
+    rows: dict[tuple[str, str], dict] = {}
+    for platform, account_id, frente in accounts:
+        frente = frente or "Sem frente"
+        target = rows.setdefault(
+            (frente, platform),
+            {"frente": frente, "canal": platform, "nome": f"{frente} · {PLATFORM_NAMES[platform]}",
+             **{key: 0.0 for key in FRENTE_KEYS}, **{f"prev_{key}": 0.0 for key in FRENTE_KEYS}},
+        )
+        for period_key, prefix in (("by_account", ""), ("by_account_previous", "prev_")):
+            source = details[platform].get(period_key, {}).get(str(account_id), {})
+            for key in FRENTE_KEYS:
+                target[f"{prefix}{key}"] += _number(source.get(key))
+    result = []
+    for frente in dict.fromkeys(key[0] for key in rows):
+        children = [_with_rates(row) for (name, _), row in rows.items() if name == frente]
+        subtotal = {"frente": frente, "canal": None, "nome": frente, "subtotal": True}
+        for key in FRENTE_KEYS:
+            subtotal[key] = sum(row[key] for row in children)
+            subtotal[f"prev_{key}"] = sum(row[f"prev_{key}"] for row in children)
+        result.append(_with_rates(subtotal))
+        result.extend(sorted(children, key=lambda row: row["investimento"], reverse=True))
+    return result
+
+
 @lru_cache(maxsize=256)
-def _dataset_cached(period_id: str, tenant_id: int, meta_account: str | None, google_customer: str | None, today: str) -> dict:
+def _dataset_cached(
+    period_id: str,
+    tenant_id: int,
+    meta_account: str | None,
+    google_customer: str | None,
+    today: str,
+    accounts: tuple = (),
+) -> dict:
     period = get_period(period_id)
     end = date.fromisoformat(today)
     if period.get("calendar") == "month":
@@ -655,6 +737,9 @@ def _dataset_cached(period_id: str, tenant_id: int, meta_account: str | None, go
     meta_totals, meta_previous = _totals(meta["series"]), _totals(meta["previous"])
     google_totals, google_previous = _totals(google["series"]), _totals(google["previous"])
     campaigns = meta["campaigns"] + google["campaigns"]
+    frente_by_account = {str(account_id): frente for _, account_id, frente in accounts}
+    for row in campaigns:
+        row["frente"] = frente_by_account.get(str(row.get("account_id") or "")) or "—"
     channels = [
         {"key": "meta", "nome": "Meta Ads", "valor": meta_totals["investimento"]},
         {"key": "google", "nome": "Google Ads", "valor": google_totals["investimento"]},
@@ -672,6 +757,7 @@ def _dataset_cached(period_id: str, tenant_id: int, meta_account: str | None, go
         "series": series, "totals": totals, "previous": previous,
         "kpis": _kpis(totals, previous, series), "channels": channels, "funnel": funnel,
         "campaigns": campaigns,
+        "frentes": _frentes(accounts, meta, google),
         "connections": {
             "meta": {key: meta.get(key) for key in ("status", "message", "error_detail", "request_id", "synced_at") if meta.get(key)},
             "google": {key: google.get(key) for key in ("status", "message", "error_detail", "request_id", "synced_at") if google.get(key)},
@@ -696,9 +782,16 @@ def _dataset_cached(period_id: str, tenant_id: int, meta_account: str | None, go
     }
 
 
-def _dataset(period_id: str, tenant_id: int, meta_account: str | None, google_customer: str | None, today: str) -> dict:
+def _dataset(
+    period_id: str,
+    tenant_id: int,
+    meta_account: str | None,
+    google_customer: str | None,
+    today: str,
+    accounts: tuple = (),
+) -> dict:
     """Serializa misses iguais para callbacks simultaneas nao duplicarem APIs."""
-    key = (period_id, tenant_id, meta_account, google_customer, today)
+    key = (period_id, tenant_id, meta_account, google_customer, today, accounts)
     with _DATASET_LOCKS_GUARD:
         lock = _DATASET_LOCKS.setdefault(key, threading.Lock())
     with lock:
@@ -710,10 +803,14 @@ def get_dataset(period_id: str = DEFAULT_PERIOD, tenant_id: int | None = None) -
     if not tenant:
         # Sem tenant não há consulta externa nem dado de outro cliente.
         return _dataset(period_id, 0, None, None, date.today().isoformat())
-    return _dataset(
-        period_id, tenant["id"], tenant.get("meta_ad_account_id"),
-        tenant.get("google_ads_customer_id"), date.today().isoformat(),
+    accounts = tuple(
+        (item["platform"], item["account_id"], item["frente"]) for item in tenant_media_accounts(tenant)
     )
+    # A presença de conta extra também liga a plataforma: um tenant cuja única
+    # conta Meta é "extra" não pode aparecer como "Meta não vinculada".
+    meta_ids = ",".join(account for platform, account, _ in accounts if platform == "meta") or None
+    google_ids = ",".join(account for platform, account, _ in accounts if platform == "google") or None
+    return _dataset(period_id, tenant["id"], meta_ids, google_ids, date.today().isoformat(), accounts)
 
 
 def clear_cache() -> None:

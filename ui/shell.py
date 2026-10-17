@@ -30,7 +30,12 @@ NAV_MAIN = [
 
 NAV_WORK = []
 
-ALL_NAV = NAV_MAIN + NAV_WORK
+# Telas que só fazem sentido quando o cliente tem a fonte cadastrada
+# (contas em mais de uma frente, planilha de leads). Ver `tenant_nav`.
+NAV_FRENTES = ("/frentes", "Frentes", "chart-column")
+NAV_LEADS = ("/leads", "Leads", "magnet")
+
+ALL_NAV = NAV_MAIN + [NAV_FRENTES, NAV_LEADS] + NAV_WORK
 PAGE_TITLES = {path: label for path, label, _ in ALL_NAV}
 
 
@@ -63,7 +68,20 @@ def _nav_item(href, label, glyph, pathname, count=None):
     )
 
 
-def sidebar(pathname: str = "/", user: dict | None = None, brand: dict | None = None):
+def tenant_nav(tenant: dict | None) -> list[tuple]:
+    from core.storage import list_lead_sources, tenant_media_accounts
+
+    if not tenant:
+        return []
+    items = []
+    if any(item.get("frente") for item in tenant_media_accounts(tenant)):
+        items.append(NAV_FRENTES)
+    if list_lead_sources(tenant.get("id")):
+        items.append(NAV_LEADS)
+    return items
+
+
+def sidebar(pathname: str = "/", user: dict | None = None, brand: dict | None = None, extra_nav=None):
     from core.auth import initials
 
     brand = brand or {"name": "V4 Company", "logo_data": None}
@@ -72,10 +90,10 @@ def sidebar(pathname: str = "/", user: dict | None = None, brand: dict | None = 
         "email": ACCOUNT["email"],
         "role": "client",
     }
-    navigation = list(NAV_MAIN)
+    navigation = [*NAV_MAIN, *(extra_nav or [])]
     work_navigation = list(NAV_WORK)
     if user.get("role") == "superadmin":
-        navigation = [("/admin", "Clientes", "building-2"), *NAV_MAIN]
+        navigation = [("/admin", "Clientes", "building-2"), *navigation]
 
     return html.Aside(
         [

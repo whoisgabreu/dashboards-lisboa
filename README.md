@@ -453,6 +453,43 @@ aparece como zero, sem estimativa inventada.
 
 ---
 
+## Frentes e leads de planilha
+
+Para clientes com mais de uma operação (ex.: uma frente de assessoria e
+uma de franquias, cada uma com a própria conta Meta) e com leads registrados em
+planilha Google.
+
+- **Mais de uma conta por plataforma.** `tenant_media_accounts` guarda contas
+  extras e o rótulo de **frente** de cada conta (inclusive da principal). O
+  sincronizador busca todas as contas da plataforma e grava na mesma troca
+  atômica; as telas existentes passam a mostrar o consolidado.
+- **Tela `/frentes`.** Investimento, impressões, cliques, CTR, CPC, leads e CPL
+  por frente × plataforma, com subtotal por frente, total, leads da planilha
+  ao lado e a tabela de campanhas com a coluna Frente. Só aparece no menu
+  quando alguma conta do cliente tem frente.
+- **Tela `/leads`.** Leads por dia, por LP (uma aba = uma LP), por
+  `utm_source/utm_medium` e por `utm_campaign` (IDs numéricos do Google Ads
+  viram o nome da campanha). Só aparece quando o cliente tem planilha.
+- **Privacidade.** De cada linha da planilha só entram data, LP e UTMs. Nome,
+  e-mail, telefone, CNPJ e observações não são gravados; UTM com cara de
+  e-mail ou telefone é descartada (linha desalinhada joga dado pessoal na
+  coluna errada).
+- **Leitura da planilha.** Com `GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE`, usa a
+  Sheets API (compartilhe a planilha com o e-mail da conta de serviço). Sem
+  ela, exporta o CSV pelo link público, por `gid`: o endpoint `gviz` zera
+  células de tipo minoritário e apagava os nomes de campanha em texto.
+
+Ainda sem tela no `/admin`; o cadastro é por comando:
+
+```bash
+python manage_sources.py conta --cliente acme --plataforma meta --conta 1234567890123456 --frente Franquias
+python manage_sources.py planilha --cliente acme --planilha <id> --aba "LP Principal" --lp "LP Principal" --frente Assessoria
+python manage_sources.py listar --cliente acme
+python manage_sources.py sincronizar --cliente acme --dias 90
+```
+
+---
+
 ## Notas de implementação
 
 - **Popovers sem JavaScript.** Todo menu já nasce no HTML com a classe `hide`;
