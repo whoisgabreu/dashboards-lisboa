@@ -259,6 +259,42 @@ def init_db() -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_invites_tenant ON user_invites(tenant_id);
+
+            CREATE TABLE IF NOT EXISTS tenant_media_accounts (
+                tenant_id BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                platform TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                frente TEXT,
+                PRIMARY KEY (platform, account_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS tenant_lead_sources (
+                tenant_id BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                sheet_id TEXT NOT NULL,
+                tab TEXT NOT NULL,
+                lp TEXT NOT NULL,
+                frente TEXT,
+                PRIMARY KEY (tenant_id, sheet_id, tab)
+            );
+
+            CREATE TABLE IF NOT EXISTS lead_entries (
+                tenant_id BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                sheet_id TEXT NOT NULL,
+                tab TEXT NOT NULL,
+                row_number INTEGER NOT NULL,
+                lead_date TEXT,
+                lp TEXT NOT NULL,
+                frente TEXT,
+                utm_source TEXT,
+                utm_medium TEXT,
+                utm_campaign TEXT,
+                utm_term TEXT,
+                has_click_id SMALLINT NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, sheet_id, tab, row_number)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_lead_entries_lookup ON lead_entries(tenant_id, lead_date);
             """
         )
 
@@ -1037,3 +1073,164 @@ def list_pending_invites(tenant_id: int | None) -> list[dict]:
 def revoke_invite(token: str | None) -> None:
     with connection() as db:
         db.execute("DELETE FROM user_invites WHERE token = ? AND accepted_at IS NULL", (token,))
+
+
+# --------------------------------------------------------------------------
+# Contas adicionais e frentes de negócio
+# --------------------------------------------------------------------------
+#
+# `tenants` guarda uma conta Meta e uma Google por cliente. Cliente com mais
+# de uma operação (ex.: uma frente de assessoria e outra de franquias, cada
+# uma com a própria conta Meta) registra as contas extras aqui. A mesma tabela também
+# rotula a conta principal com a frente, sem duplicá-la.
+
+def _clean_account(platform: str, account_id: str | None) -> str | None:
+    if platform == "meta":
+        return _clean_meta_account_id(account_id)
+    if platform == "google":
+        return _clean_google_customer_id(account_id)
+    raise ValueError("Plataforma inválida.")
+
+
+def set_tenant_media_account(tenant_id: int, platform: str, account_id: str, frente: str | None = None) -> None:
+    account_id = _clean_account(platform, account_id)
+    if not account_id:
+        raise ValueError("Informe a conta.")
+    frente = (frente or "").strip() or None
+    with connection() as db:
+        owner = db.execute(
+            "SELECT id FROM tenants WHERE id != ? AND "
+            + ("meta_ad_account_id" if platform == "meta" else "google_ads_customer_id") + " = ?",
+            (tenant_id, account_id),
+        ).fetchone()
+        if owner:
+            raise ValueError("Esta conta já está vinculada a outro cliente.")
+        db.execute(
+            """
+            INSERT INTO tenant_media_accounts (tenant_id, platform, account_id, frente)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (platform, account_id) DO UPDATE SET
+                tenant_id = excluded.tenant_id, frente = excluded.frente
+            """,
+            (tenant_id, platform, account_id, frente),
+        )
+
+
+def tenant_media_accounts(tenant: dict | None, platform: str | None = None) -> list[dict]:
+    """Conta principal + contas extras, cada uma com a frente (ou None)."""
+    if not tenant or not tenant.get("id"):
+        return []
+    with connection() as db:
+        rows = db.execute(
+            "SELECT platform, account_id, frente FROM tenant_media_accounts WHERE tenant_id = ? "
+            "ORDER BY platform, account_id",
+            (tenant["id"],),
+        ).fetchall()
+    labels = {(row["platform"], row["account_id"]): row["frente"] for row in rows}
+    result = []
+    for name, field in (("meta", "meta_ad_account_id"), ("google", "google_ads_customer_id")):
+        if tenant.get(field):
+            result.append({"platform": name, "account_id": tenant[field], "frente": labels.get((name, tenant[field]))})
+    primary = {(item["platform"], item["account_id"]) for item in result}
+    result.extend(
+        {"platform": row["platform"], "account_id": row["account_id"], "frente": row["frente"]}
+        for row in rows
+        if (row["platform"], row["account_id"]) not in primary
+    )
+    if platform:
+        result = [item for item in result if item["platform"] == platform]
+    return result
+
+
+def media_campaign_names(tenant_id: int) -> dict[str, dict]:
+    """id -> {nome, canal, account_id} de todas as campanhas já sincronizadas."""
+    with connection() as db:
+        rows = db.execute(
+            "SELECT campaign_id, campaign_name, platform, account_id, MAX(metric_date) AS last_date "
+            "FROM media_daily_metrics WHERE tenant_id = ? AND campaign_id IS NOT NULL AND campaign_id != '' "
+            "GROUP BY campaign_id, campaign_name, platform, account_id",
+            (tenant_id,),
+        ).fetchall()
+    result: dict[str, dict] = {}
+    for row in sorted((dict(r) for r in rows), key=lambda r: r["last_date"] or ""):
+        result[str(row["campaign_id"])] = {
+            "nome": row["campaign_name"], "canal": row["platform"], "account_id": row["account_id"],
+        }
+    return result
+
+
+# --------------------------------------------------------------------------
+# Leads de planilha
+# --------------------------------------------------------------------------
+#
+# Só o necessário para contar leads por LP e origem: data, LP e UTMs. Nome,
+# e-mail, telefone, CNPJ e observações do comercial NUNCA entram no banco.
+
+def set_lead_source(tenant_id: int, sheet_id: str, tab: str, lp: str, frente: str | None = None) -> None:
+    sheet_id, tab, lp = (sheet_id or "").strip(), (tab or "").strip(), (lp or "").strip()
+    if not (sheet_id and tab and lp):
+        raise ValueError("Informe planilha, aba e LP.")
+    with connection() as db:
+        db.execute(
+            """
+            INSERT INTO tenant_lead_sources (tenant_id, sheet_id, tab, lp, frente)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (tenant_id, sheet_id, tab) DO UPDATE SET
+                lp = excluded.lp, frente = excluded.frente
+            """,
+            (tenant_id, sheet_id, tab, lp, (frente or "").strip() or None),
+        )
+
+
+def list_lead_sources(tenant_id: int | None) -> list[dict]:
+    if not tenant_id:
+        return []
+    with connection() as db:
+        rows = db.execute(
+            "SELECT * FROM tenant_lead_sources WHERE tenant_id = ? ORDER BY lp", (tenant_id,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+LEAD_COLUMNS = (
+    "tenant_id", "sheet_id", "tab", "row_number", "lead_date", "lp", "frente",
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "has_click_id", "updated_at",
+)
+
+
+def replace_lead_entries(tenant_id: int, sheet_id: str, tab: str, rows: list[dict]) -> int:
+    """A aba inteira é relida a cada sincronização: troca tudo de uma vez."""
+    placeholders = ", ".join("?" for _ in LEAD_COLUMNS)
+    values = [tuple(row.get(column) for column in LEAD_COLUMNS) for row in rows]
+    with connection() as db:
+        db.execute(
+            "DELETE FROM lead_entries WHERE tenant_id = ? AND sheet_id = ? AND tab = ?",
+            (tenant_id, sheet_id, tab),
+        )
+        if values:
+            db.executemany(
+                f"INSERT INTO lead_entries ({', '.join(LEAD_COLUMNS)}) VALUES ({placeholders})",
+                values,
+            )
+    return len(rows)
+
+
+def get_lead_entries(tenant_id: int, start: str, end: str) -> list[dict]:
+    with connection() as db:
+        rows = db.execute(
+            "SELECT * FROM lead_entries WHERE tenant_id = ? AND lead_date BETWEEN ? AND ? "
+            "ORDER BY lead_date",
+            (tenant_id, start, end),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def lead_entries_summary(tenant_id: int) -> dict:
+    with connection() as db:
+        row = db.execute(
+            "SELECT COUNT(*) AS total, MAX(lead_date) AS last_date, MAX(updated_at) AS synced_at, "
+            "SUM(CASE WHEN lead_date IS NULL THEN 1 ELSE 0 END) AS undated "
+            "FROM lead_entries WHERE tenant_id = ?",
+            (tenant_id,),
+        ).fetchone()
+    return dict(row) if row else {}

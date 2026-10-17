@@ -17,6 +17,7 @@ from core.storage import (
     media_coverage_bounds,
     replace_media_rows,
     set_media_sync_state,
+    tenant_media_accounts,
 )
 
 
@@ -61,8 +62,8 @@ def _with_metrics(target: dict, values: dict) -> dict:
     return target
 
 
-def fetch_meta_rows(tenant: dict, start: date, end: date) -> list[dict]:
-    account_id = tenant.get("meta_ad_account_id")
+def fetch_meta_rows(tenant: dict, start: date, end: date, account_id: str | None = None) -> list[dict]:
+    account_id = account_id or tenant.get("meta_ad_account_id")
     if not account_id:
         return []
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -184,8 +185,8 @@ def _google_entity_row(tenant: dict, account_id: str, source: dict, level: str) 
     return row
 
 
-def fetch_google_rows(tenant: dict, start: date, end: date) -> list[dict]:
-    account_id = tenant.get("google_ads_customer_id")
+def fetch_google_rows(tenant: dict, start: date, end: date, account_id: str | None = None) -> list[dict]:
+    account_id = account_id or tenant.get("google_ads_customer_id")
     if not account_id:
         return []
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -216,9 +217,14 @@ def fetch_google_rows(tenant: dict, start: date, end: date) -> list[dict]:
     return rows
 
 
+def platform_account_ids(tenant: dict, platform: str) -> list[str]:
+    """Conta principal do tenant + contas extras (`tenant_media_accounts`)."""
+    return [item["account_id"] for item in tenant_media_accounts(tenant, platform)]
+
+
 def sync_platform(tenant: dict, platform: str, start: date, end: date) -> int:
-    account_id = tenant.get("meta_ad_account_id" if platform == "meta" else "google_ads_customer_id")
-    if not account_id:
+    account_ids = platform_account_ids(tenant, platform)
+    if not account_ids:
         return 0
     started_at = _now()
     set_media_sync_state(
@@ -226,7 +232,10 @@ def sync_platform(tenant: dict, platform: str, start: date, end: date) -> int:
         window_start=start.isoformat(), window_end=end.isoformat(),
     )
     try:
-        rows = fetch_meta_rows(tenant, start, end) if platform == "meta" else fetch_google_rows(tenant, start, end)
+        # Todas as contas da plataforma entram na mesma troca atômica: se uma
+        # falhar, a janela inteira fica como estava em vez de meio atualizada.
+        fetch = fetch_meta_rows if platform == "meta" else fetch_google_rows
+        rows = [row for account_id in account_ids for row in fetch(tenant, start, end, account_id)]
         total = replace_media_rows(tenant["id"], platform, start.isoformat(), end.isoformat(), rows)
         mark_media_sync_window(tenant["id"], platform, start.isoformat(), end.isoformat())
         set_media_sync_state(
@@ -270,7 +279,7 @@ def kickoff_first_sync(tenant: dict, days: int = 30) -> None:
     tenant_id = tenant.get("id")
     if not tenant_id:
         return
-    if not (tenant.get("meta_ad_account_id") or tenant.get("google_ads_customer_id")):
+    if not tenant_media_accounts(tenant):
         return
 
     with _kickoff_lock:
@@ -290,6 +299,12 @@ def kickoff_first_sync(tenant: dict, days: int = 30) -> None:
                     # do erro já ficou gravado por `sync_platform`.
                     logger.warning("Sync inicial de %s falhou para %s: %s",
                                    platform, tenant.get("name"), exc)
+            try:
+                from core.leads import sync_leads
+
+                sync_leads(tenant)
+            except Exception as exc:
+                logger.warning("Sync inicial de leads falhou para %s: %s", tenant.get("name"), exc)
         finally:
             with _kickoff_lock:
                 _kickoff_running.discard(tenant_id)

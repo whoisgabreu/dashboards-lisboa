@@ -259,7 +259,7 @@ def _serve_layout():
             dcc.Store(id="chart-store", storage_type="local", data=None),
             html.Div(
                 [
-                    shell.sidebar(pathname, user=user, brand=brand),
+                    shell.sidebar(pathname, user=user, brand=brand, extra_nav=shell.tenant_nav(tenant)),
                     html.Div(id="drawer-scrim", n_clicks=0, className="sidebar__scrim hide"),
                     html.Div(
                         [
